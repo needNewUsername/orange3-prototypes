@@ -1,15 +1,14 @@
 import copy
 from numbers import Number
 from queue import Queue, Empty
-from itertools import combinations
 from types import SimpleNamespace
 from typing import Iterable
-from threading import Timer, Lock
+from threading import Timer
 import time
 import numpy as np
 
 from AnyQt.QtCore import QModelIndex, Qt, QAbstractTableModel, QSortFilterProxyModel
-from AnyQt.QtWidgets import QTableView, QVBoxLayout, QHeaderView
+from AnyQt.QtWidgets import QTableView, QVBoxLayout, QHeaderView, QLineEdit
 
 from Orange.data import Variable, Table
 from Orange.widgets import gui
@@ -34,9 +33,9 @@ class RankModel(QAbstractTableModel):
         self._headers = {}
 
     def set_domain(self, table):
-        self._domain = table.domain
+        self.domain = table.domain
         n_attrs = len(table.domain.attributes)
-        self._n_comb = n_attrs * (n_attrs - 1) // 2
+        self.n_comb = n_attrs * (n_attrs - 1) // 2
 
     def set_scorer(self, scorer):
         self.scorer = scorer
@@ -52,15 +51,14 @@ class RankModel(QAbstractTableModel):
             return
 
         # row = self.mapToSourceRows(index.row())
-        row = index.row()
-        col = index.column()
+        row, col = index.row(), index.column()
 
         try:
             value = self._data[row, col]
             if role == Qt.EditRole:
                 return value
             if col >= self._columns - 2:
-                value = self._domain[value]
+                value = self.domain[value]
         except IndexError:
             return
         if role == Qt.DecorationRole and isinstance(value, Variable):
@@ -109,7 +107,7 @@ class RankModel(QAbstractTableModel):
             self.beginInsertRows(QModelIndex(), self._rows, min(self._max_rows, self._rows + n_rows) - 1)
 
         if self._rows + n_rows >= n_data:
-            n_data = min(max(n_data + n_rows, 2 * n_data), self._n_comb)
+            n_data = min(max(n_data + n_rows, 2 * n_data), self.n_comb)
             ar = np.full((n_data, self._columns), np.nan)
             ar[:self._rows] = self._data[:self._rows]
             self._data = ar
@@ -126,24 +124,24 @@ class RankModel(QAbstractTableModel):
     def __len__(self):
         return self._rows
 
-    def source_data(self):
-        return self._data
+    def column_data(self, column):
+        return self._data[:self._rows, column]
 
 
-class ModelProxy(QSortFilterProxyModel):
+class ProxyModel(QSortFilterProxyModel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self.__sortInd: np.ndarray
+        self.__sortInd = None  # type: np.ndarray
         self.__sortColumn = -1
         self.__sortOrder = Qt.DescendingOrder
 
-    def setSourceModel(self, model):
-        super().setSourceModel(model)
-        self._data = model.source_data()
+        self.filter_text = None
+        self.filter_values = None
+        self.mask = None
 
     def sort(self, column: int, order=Qt.DescendingOrder):
-        if self._data is None:
+        if self.sourceModel()._data is None:
             return
         indices = self._sort(column, order)
         self.__sortColumn = column
@@ -159,7 +157,7 @@ class ModelProxy(QSortFilterProxyModel):
         if column < 0:
             return
 
-        data = self._data[:self._rows, column]
+        data = self.sourceModel().column_data(column)
         return self._argsortData(data, order)
 
     def _argsortData(self, data, order):
@@ -169,12 +167,13 @@ class ModelProxy(QSortFilterProxyModel):
         return indices
 
     def sort_new(self, n_rows):
-        data = self._data[:self._rows, self.__sortColumn]
-        old_rows = self._rows - n_rows
-        ind = np.arange(old_rows, self._rows)
+        data = self.sourceModel().column_data(self.__sortColumn)
+        all_rows = len(self.sourceModel())
+        old_rows = all_rows - n_rows
+        ind = np.arange(old_rows, all_rows)
         order = 1 if self.__sortOrder == Qt.AscendingOrder else -1
         loc = np.searchsorted(data[:old_rows],
-                              data[old_rows:self._rows],
+                              data[old_rows:all_rows],
                               sorter=self.__sortInd[::order])
         indices = np.insert(self.__sortInd[::order], loc, ind)[::order]
         self._setSortIndices(indices)
@@ -183,6 +182,10 @@ class ModelProxy(QSortFilterProxyModel):
         return self.sort(-1)
 
     def mapToSourceRows(self, rows):
+        if self.mask is not None and \
+                (isinstance(rows, (int, type(Ellipsis)))
+                 or len(rows)):
+            return np.nonzero(self.mask)[0][rows]
         if self.__sortInd is not None and \
                 (isinstance(rows, (int, type(Ellipsis)))
                  or len(rows)):
@@ -190,7 +193,32 @@ class ModelProxy(QSortFilterProxyModel):
         return rows
 
     def mapToSource(self, index):
-        return index
+        row = self.mapToSourceRows(index.row())
+        return self.sourceModel().index(row, index.column())
+
+    def append(self, rows):
+        self.sourceModel().append(rows)
+        if self.__sortColumn >= 0:
+            self.sort_new(len(rows))
+
+    def data(self, index:QModelIndex, role=Qt.DisplayRole):
+        row = self.mapToSourceRows(index.row())
+        return self.sourceModel().data(self.sourceModel().index(row, index.column()), role)
+
+    def set_filter(self, text):
+        if text == "":
+            self.filter_text = self.filter_values = self.mask = None
+        self.filter_text = str(text).lower()
+        self.filter_values = [i for i, name in enumerate(self.domain_names) if self.filter_text in name]
+        self.mask = np.isin(self.sourceModel()._data[:, -2:], self.filter_values).any(axis=1)
+        self.invalidateFilter()
+
+    def filterAcceptsRow(self, row, parent):
+        return self.mask[row] if self.filter_text else True
+
+    def set_domain(self, table):
+        self.sourceModel().set_domain(table)
+        self.domain_names = [attr.name.lower() for attr in self.sourceModel().domain.attributes]
 
 
 class Widget(OWWidget, ConcurrentWidgetMixin):
@@ -211,11 +239,16 @@ class Widget(OWWidget, ConcurrentWidgetMixin):
 
         self.setLayout(QVBoxLayout())
 
+        self.filter = QLineEdit()
+        self.filter.setPlaceholderText("Filter ...")
+        self.filter.textChanged.connect(self.filter_changed)
+        self.setFocus(Qt.ActiveWindowFocusReason)
+
         self.model = RankModel()
         self.model.setHorizontalHeaderLabels([
             "Score 1", "Feature 1", "Feature 2"
         ])
-        self.proxy = ModelProxy()
+        self.proxy = ProxyModel()
         self.proxy.setSourceModel(self.model)
         view = QTableView(selectionBehavior=QTableView.SelectRows,
                           selectionMode=QTableView.SingleSelection,
@@ -227,8 +260,12 @@ class Widget(OWWidget, ConcurrentWidgetMixin):
 
         self.button = gui.button(self, self, "do stuff", callback=self.toggle)
 
+        self.layout().addWidget(self.filter)
         self.layout().addWidget(view)
         self.layout().addWidget(self.button)
+
+    def filter_changed(self, text):
+        self.proxy.set_filter(text)
 
     def toggle(self):
         self.running = not self.running
@@ -255,7 +292,7 @@ class Widget(OWWidget, ConcurrentWidgetMixin):
                 rows.append(row_item)
         except Empty:
             if rows:
-                self.model.append(rows)
+                self.proxy.append(rows)
 
         self.progress = len(self.model)
         self.progressBarSet(int(self.progress * 100 / (self.attrs*(self.attrs-1)//2)))
@@ -265,7 +302,7 @@ class Widget(OWWidget, ConcurrentWidgetMixin):
 
     @Inputs.data
     def set_data(self, data):
-        self.model.set_domain(data)
+        self.proxy.set_domain(data)
         self.attrs = len(data.domain.attributes)
 
     def iterate_states(self, initial_state):
@@ -330,4 +367,6 @@ def run(compute, attrs, iterate_states, saved_state, progress, task):
 
 
 if __name__ == "__main__":
-    WidgetPreview(Widget).run(Table("/Users/noah/Nextcloud/Fri/tables/GDS3713-small.tab"))
+    # WidgetPreview(Widget).run(Table("iris"))
+    WidgetPreview(Widget).run(Table("/Users/noah/Nextcloud/Fri/tables/mushrooms.tab"))
+    # WidgetPreview(Widget).run(Table("/Users/noah/Nextcloud/Fri/tables/GDS3713-small.tab"))
