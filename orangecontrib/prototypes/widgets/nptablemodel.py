@@ -7,7 +7,7 @@ from threading import Timer
 import time
 import numpy as np
 
-from AnyQt.QtCore import QModelIndex, Qt, QAbstractTableModel, QSortFilterProxyModel
+from AnyQt.QtCore import QModelIndex, Qt, QAbstractTableModel
 from AnyQt.QtWidgets import QTableView, QVBoxLayout, QHeaderView, QLineEdit
 
 from Orange.data import Variable, Table
@@ -18,24 +18,31 @@ from Orange.widgets.utils.concurrent import ConcurrentWidgetMixin
 from Orange.widgets.utils.signals import Input
 
 
+MAX_ROWS = int(1e9)
+
+
 class RankModel(QAbstractTableModel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        # self.__sortInd: np.ndarray
-        # self.__sortColumn = -1
-        # self.__sortOrder = Qt.DescendingOrder
+        self.__sortInd = ...  # type: np.ndarray
+        self.__sortColumn = -1
+        self.__sortOrder = Qt.DescendingOrder
+
+        self.__filterInd = ...  # type: np.ndarray
+        self.__filterAttrs = None
 
         self._data = None  # type: np.ndarray
         self._columns = 0
         self._rows = 0
-        self._max_rows = int(1e9)
+        self._max_rows = MAX_ROWS
         self._headers = {}
 
     def set_domain(self, table):
         self.domain = table.domain
         n_attrs = len(table.domain.attributes)
         self.n_comb = n_attrs * (n_attrs - 1) // 2
+        self.attr_names = [attr.name.lower() for attr in self.domain.attributes]
 
     def set_scorer(self, scorer):
         self.scorer = scorer
@@ -46,12 +53,12 @@ class RankModel(QAbstractTableModel):
     def columnCount(self, parent=QModelIndex(), *args, **kwargs):
         return 0 if parent.isValid() else self._columns
 
-    def data(self, index, role=Qt.DisplayRole):
+    def data(self, index: QModelIndex, role=Qt.DisplayRole):
         if not index.isValid():
             return
 
-        # row = self.mapToSourceRows(index.row())
-        row, col = index.row(), index.column()
+        row = self.mapToSourceRows(index.row())
+        col = index.column()
 
         try:
             value = self._data[row, col]
@@ -85,14 +92,16 @@ class RankModel(QAbstractTableModel):
         self.beginResetModel()
         self._data = np.array(data)
         self._rows, self._columns = self._data.shape
-        # self.unsort()
+        self.reset_sort()
+        self.reset_filter()
         self.endResetModel()
 
     def clear(self):
         self.beginResetModel()
         self._data = None
         self._rows = self._columns = 0
-        # self.unsort()
+        self.reset_sort()
+        self.reset_filter()
         self.endResetModel()
 
     def append(self, rows):
@@ -118,35 +127,25 @@ class RankModel(QAbstractTableModel):
         if insert:
             self.endInsertRows()
 
-        # if self.__sortColumn >= 0:
-        #     self.sort_new(n_rows)
+        if self.__sortColumn >= 0:
+            self.sort_new(n_rows)
+
+        if isinstance(self.__filterInd, np.ndarray):
+            self.reset_filter()
 
     def __len__(self):
         return self._rows
 
-    def column_data(self, column):
-        return self._data[:self._rows, column]
-
-
-class ProxyModel(QSortFilterProxyModel):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-        self.__sortInd = None  # type: np.ndarray
-        self.__sortColumn = -1
-        self.__sortOrder = Qt.DescendingOrder
-
-        self.filter_text = None
-        self.filter_values = None
-        self.mask = None
-
     def sort(self, column: int, order=Qt.DescendingOrder):
-        if self.sourceModel()._data is None:
+        if self._data is None:
             return
         indices = self._sort(column, order)
         self.__sortColumn = column
         self.__sortOrder = order
-        self._setSortIndices(indices)
+        if isinstance(self.__filterInd, np.ndarray):
+            self._filterAndSort(indices)
+        else:
+            self._setSortIndices(indices)
 
     def _setSortIndices(self, indices):
         self.layoutAboutToBeChanged.emit([], QAbstractTableModel.VerticalSortHint)
@@ -155,9 +154,9 @@ class ProxyModel(QSortFilterProxyModel):
 
     def _sort(self, column, order):
         if column < 0:
-            return
+            return ...
 
-        data = self.sourceModel().column_data(column)
+        data = self._data[:self._rows, column]
         return self._argsortData(data, order)
 
     def _argsortData(self, data, order):
@@ -167,58 +166,49 @@ class ProxyModel(QSortFilterProxyModel):
         return indices
 
     def sort_new(self, n_rows):
-        data = self.sourceModel().column_data(self.__sortColumn)
-        all_rows = len(self.sourceModel())
-        old_rows = all_rows - n_rows
-        ind = np.arange(old_rows, all_rows)
+        data = self._data[:self._rows, self.__sortColumn]
+        old_rows = self._rows - n_rows
+        ind = np.arange(old_rows, self._rows)
         order = 1 if self.__sortOrder == Qt.AscendingOrder else -1
         loc = np.searchsorted(data[:old_rows],
-                              data[old_rows:all_rows],
+                              data[old_rows:self._rows],
                               sorter=self.__sortInd[::order])
         indices = np.insert(self.__sortInd[::order], loc, ind)[::order]
         self._setSortIndices(indices)
 
-    def unsort(self):
+    def reset_sort(self):
         return self.sort(-1)
 
-    def mapToSourceRows(self, rows):
-        if self.mask is not None and \
-                (isinstance(rows, (int, type(Ellipsis)))
-                 or len(rows)):
-            return np.nonzero(self.mask)[0][rows]
-        if self.__sortInd is not None and \
-                (isinstance(rows, (int, type(Ellipsis)))
-                 or len(rows)):
-            return self.__sortInd[rows]
-        return rows
-
-    def mapToSource(self, index):
-        row = self.mapToSourceRows(index.row())
-        return self.sourceModel().index(row, index.column())
-
-    def append(self, rows):
-        self.sourceModel().append(rows)
-        if self.__sortColumn >= 0:
-            self.sort_new(len(rows))
-
-    def data(self, index:QModelIndex, role=Qt.DisplayRole):
-        row = self.mapToSourceRows(index.row())
-        return self.sourceModel().data(self.sourceModel().index(row, index.column()), role)
-
     def set_filter(self, text):
-        if text == "":
-            self.filter_text = self.filter_values = self.mask = None
-        self.filter_text = str(text).lower()
-        self.filter_values = [i for i, name in enumerate(self.domain_names) if self.filter_text in name]
-        self.mask = np.isin(self.sourceModel()._data[:, -2:], self.filter_values).any(axis=1)
-        self.invalidateFilter()
+        if self._data is None:
+            return
 
-    def filterAcceptsRow(self, row, parent):
-        return self.mask[row] if self.filter_text else True
+        self.layoutAboutToBeChanged.emit([])
+        if not text:
+            self.__filterInd = ...
+            self._max_rows = MAX_ROWS
+        else:
+            self.__filterAttrs = [i for i, name in enumerate(self.attr_names) if str(text).lower() in name]
+            self.__filterInd = np.isin(self._data[:, -2:][self.__sortInd], self.__filterAttrs).any(axis=1).nonzero()[0]
+            self._max_rows = len(self.__filterInd)
+        self.layoutChanged.emit([])
 
-    def set_domain(self, table):
-        self.sourceModel().set_domain(table)
-        self.domain_names = [attr.name.lower() for attr in self.sourceModel().domain.attributes]
+    def reset_filter(self):
+        return self.set_filter("")
+
+    def _filterAndSort(self, indices):
+        self.layoutAboutToBeChanged.emit([])
+        self.__sortInd = indices
+        self.__filterInd = np.isin(self._data[:, -2:][self.__sortInd], self.__filterAttrs).any(axis=1).nonzero()[0]
+        self.layoutChanged.emit([])
+
+    def mapToSourceRows(self, rows):
+        if isinstance(rows, (int, type(Ellipsis))) or len(rows):
+            if isinstance(self.__filterInd, np.ndarray):
+                rows = self.__filterInd[rows]
+            if isinstance(self.__sortInd, np.ndarray):
+                rows = self.__sortInd[rows]
+        return rows
 
 
 class Widget(OWWidget, ConcurrentWidgetMixin):
@@ -248,15 +238,13 @@ class Widget(OWWidget, ConcurrentWidgetMixin):
         self.model.setHorizontalHeaderLabels([
             "Score 1", "Feature 1", "Feature 2"
         ])
-        self.proxy = ProxyModel()
-        self.proxy.setSourceModel(self.model)
         view = QTableView(selectionBehavior=QTableView.SelectRows,
                           selectionMode=QTableView.SingleSelection,
                           showGrid=False,
                           editTriggers=gui.TableView.NoEditTriggers)
         view.setSortingEnabled(True)
         view.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        view.setModel(self.proxy)
+        view.setModel(self.model)
 
         self.button = gui.button(self, self, "do stuff", callback=self.toggle)
 
@@ -265,7 +253,7 @@ class Widget(OWWidget, ConcurrentWidgetMixin):
         self.layout().addWidget(self.button)
 
     def filter_changed(self, text):
-        self.proxy.set_filter(text)
+        self.model.set_filter(text)
 
     def toggle(self):
         self.running = not self.running
@@ -273,6 +261,8 @@ class Widget(OWWidget, ConcurrentWidgetMixin):
             self.button.setText("Pause")
             self.button.repaint()
             self.progressBarInit()
+            self.filter.setText("")
+            self.filter.setEnabled(False)
             self.start(run, compute_score,
                        self.attrs, self.iterate_states,
                        self.saved_state, self.progress)
@@ -281,6 +271,7 @@ class Widget(OWWidget, ConcurrentWidgetMixin):
             self.button.repaint()
             self.cancel()
             self.progressBarFinished()
+            self.filter.setEnabled(True)
 
     def on_partial_result(self, result):
         rows = []
@@ -292,7 +283,7 @@ class Widget(OWWidget, ConcurrentWidgetMixin):
                 rows.append(row_item)
         except Empty:
             if rows:
-                self.proxy.append(rows)
+                self.model.append(rows)
 
         self.progress = len(self.model)
         self.progressBarSet(int(self.progress * 100 / (self.attrs*(self.attrs-1)//2)))
@@ -302,7 +293,7 @@ class Widget(OWWidget, ConcurrentWidgetMixin):
 
     @Inputs.data
     def set_data(self, data):
-        self.proxy.set_domain(data)
+        self.model.set_domain(data)
         self.attrs = len(data.domain.attributes)
 
     def iterate_states(self, initial_state):
