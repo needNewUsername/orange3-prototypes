@@ -12,10 +12,11 @@ from AnyQt.QtWidgets import QTableView, QVBoxLayout, QHeaderView, QLineEdit
 
 from Orange.data import Variable, Table
 from Orange.widgets import gui
-from Orange.widgets.utils.widgetpreview import WidgetPreview
 from Orange.widgets.widget import OWWidget
+from Orange.widgets.utils.widgetpreview import WidgetPreview
 from Orange.widgets.utils.concurrent import ConcurrentWidgetMixin
 from Orange.widgets.utils.signals import Input
+from Orange.widgets.utils.itemmodels import DomainModel
 
 
 MAX_ROWS = int(1e9)
@@ -222,12 +223,23 @@ class Widget(OWWidget, ConcurrentWidgetMixin):
         OWWidget.__init__(self)
         ConcurrentWidgetMixin.__init__(self)
 
-        self.attrs = 0
-        self.progress = 0
-        self.running = False
+        self.keep_running = True
         self.saved_state = None
+        self.progress = 0
+
+        self.data = None
+        self.attrs = 0
 
         self.setLayout(QVBoxLayout())
+
+        self.feature = self.feature_index = None
+        self.feature_model = DomainModel(
+            order=DomainModel.ATTRIBUTES, separators=False,
+            placeholder="(All combinations)")
+        gui.comboBox(
+            self, self, "feature", callback=self.feature_combo_changed,
+            model=self.feature_model, searchable=True
+        )
 
         self.filter = QLineEdit()
         self.filter.setPlaceholderText("Filter ...")
@@ -246,7 +258,7 @@ class Widget(OWWidget, ConcurrentWidgetMixin):
         view.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         view.setModel(self.model)
 
-        self.button = gui.button(self, self, "do stuff", callback=self.toggle)
+        self.button = gui.button(self, self, "Start", callback=self.toggle)
 
         self.layout().addWidget(self.filter)
         self.layout().addWidget(view)
@@ -255,17 +267,41 @@ class Widget(OWWidget, ConcurrentWidgetMixin):
     def filter_changed(self, text):
         self.model.set_filter(text)
 
+    def feature_combo_changed(self):
+        self.feature_index = self.feature and self.data.domain.index(self.feature)
+        self.initialize()
+
+    def initialize(self):
+        if self.task is not None:
+            self.keep_running = False
+            self.cancel()
+        self.keep_running = True
+        self.saved_state = None
+        self.progress = 0
+        self.progressBarFinished()
+        self.model.clear()
+        self.button.setText("Start")
+        self.button.setEnabled(True)
+
+    @Inputs.data
+    def set_data(self, data):
+        self.data = data
+        self.model.set_domain(data)
+        self.attrs = len(data.domain.attributes)
+        self.feature_model.set_domain(data.domain)
+        self.initialize()
+
     def toggle(self):
-        self.running = not self.running
-        if self.running:
+        self.keep_running = not self.keep_running
+        if not self.keep_running:
             self.button.setText("Pause")
             self.button.repaint()
             self.progressBarInit()
             self.filter.setText("")
             self.filter.setEnabled(False)
             self.start(run, compute_score,
-                       self.attrs, self.iterate_states,
-                       self.saved_state, self.progress)
+                       self.iterate_states, self.saved_state,
+                       self.state_count(), self.progress)
         else:
             self.button.setText("Continue")
             self.button.repaint()
@@ -286,22 +322,33 @@ class Widget(OWWidget, ConcurrentWidgetMixin):
                 self.model.append(rows)
 
         self.progress = len(self.model)
-        self.progressBarSet(int(self.progress * 100 / (self.attrs*(self.attrs-1)//2)))
+        self.progressBarSet(self.progress * 100 // self.state_count())
 
     def on_done(self, result):
-        self.button.setText("done")
-
-    @Inputs.data
-    def set_data(self, data):
-        self.model.set_domain(data)
-        self.attrs = len(data.domain.attributes)
+        self.button.setText("Finished")
+        self.button.setEnabled(False)
+        self.filter.setEnabled(True)
 
     def iterate_states(self, initial_state):
-        si, sj = initial_state or (0, 0)
-        for i in range(si, self.attrs):
-            for j in range(sj, i):
+        if self.feature is not None:
+            return self._iterate_by_feature(initial_state)
+        return self._iterate_all(initial_state)
+
+    def _iterate_all(self, initial_state):
+        i0, j0 = initial_state or (0, 0)
+        for i in range(i0, self.attrs):
+            for j in range(j0, i):
                 yield i, j
-            sj = 0
+            j0 = 0
+
+    def _iterate_by_feature(self, initial_state):
+        _, j0 = initial_state or (0, 0)
+        for j in range(j0, self.attrs):
+            if j != self.feature_index:
+                yield self.feature_index, j
+
+    def state_count(self):
+        return self.attrs if self.feature is not None else self.attrs * (self.attrs - 1) // 2
 
 
 class QueuedScore(SimpleNamespace):
@@ -315,7 +362,7 @@ def compute_score(state):
     return sum(state),
 
 
-def run(compute, attrs, iterate_states, saved_state, progress, task):
+def run(compute, iterate_states, saved_state, state_count, progress, task):
     task.set_status("Getting combinations...")
     task.set_progress_value(0.1)
     states = iterate_states(saved_state)
@@ -342,7 +389,7 @@ def run(compute, attrs, iterate_states, saved_state, progress, task):
         while True:
             if task.is_interruption_requested():
                 return queue
-            task.set_progress_value(progress * 100 // (attrs*(attrs-1)//2))
+            task.set_progress_value(progress * 100 // state_count)
             progress += 1
             state = copy.copy(next_state)
             next_state = copy.copy(next(states))
