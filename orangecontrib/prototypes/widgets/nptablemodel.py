@@ -1,9 +1,7 @@
 import copy
 from numbers import Number
-from queue import Queue, Empty
-from types import SimpleNamespace
-from typing import Iterable
-from threading import Timer
+from typing import Iterable, Callable
+from threading import Timer, Lock
 import time
 import numpy as np
 
@@ -14,7 +12,7 @@ from Orange.data import Variable, Table
 from Orange.widgets import gui
 from Orange.widgets.widget import OWWidget
 from Orange.widgets.utils.widgetpreview import WidgetPreview
-from Orange.widgets.utils.concurrent import ConcurrentWidgetMixin
+from Orange.widgets.utils.concurrent import ConcurrentWidgetMixin, TaskState
 from Orange.widgets.utils.signals import Input
 from Orange.widgets.utils.itemmodels import DomainModel
 
@@ -37,7 +35,7 @@ class RankModel(QAbstractTableModel):
         self._columns = 0
         self._rows = 0
         self._max_rows = MAX_ROWS
-        self._headers = {}
+        self._headers = []
 
     def set_domain(self, table):
         self.domain = table.domain
@@ -80,14 +78,16 @@ class RankModel(QAbstractTableModel):
         if role == Qt.ToolTipRole:
             return str(value)
 
-    def setHorizontalHeaderLabels(self, labels):
-        self._headers[Qt.Horizontal] = tuple(labels)
+    def setHorizontalHeaderLabels(self, labels: Iterable):
+        self._headers = labels
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
-        headers = self._headers.get(orientation)
-        if headers and section < len(headers) and role == Qt.DisplayRole:
-            return headers[section]
-        return super().headerData(section, orientation, role)
+        if role == Qt.DisplayRole:
+            if orientation == Qt.Horizontal and section < len(self._headers):
+                return self._headers[section]
+            if orientation == Qt.Vertical:
+                return section + 1
+        return
 
     def initialize(self, data):
         self.beginResetModel()
@@ -299,7 +299,7 @@ class Widget(OWWidget, ConcurrentWidgetMixin):
             self.progressBarInit()
             self.filter.setText("")
             self.filter.setEnabled(False)
-            self.start(run, compute_score,
+            self.start(run, compute_score, row_for_state,
                        self.iterate_states, self.saved_state,
                        self.state_count(), self.progress)
         else:
@@ -310,19 +310,12 @@ class Widget(OWWidget, ConcurrentWidgetMixin):
             self.filter.setEnabled(True)
 
     def on_partial_result(self, result):
-        rows = []
-        try:
-            while True:
-                queued = result.get_nowait()
-                self.saved_state = queued.next_state
-                row_item = list(queued.score) + list(queued.state)
-                rows.append(row_item)
-        except Empty:
-            if rows:
-                self.model.append(rows)
-
-        self.progress = len(self.model)
-        self.progressBarSet(self.progress * 100 // self.state_count())
+        add_to_model, latest_state = result.get()
+        if add_to_model:
+            self.saved_state = latest_state
+            self.model.append(add_to_model)
+            self.progress = len(self.model)
+            self.progressBarSet(self.progress * 100 // self.state_count())
 
     def on_done(self, result):
         self.button.setText("Finished")
@@ -351,10 +344,22 @@ class Widget(OWWidget, ConcurrentWidgetMixin):
         return self.attrs if self.feature is not None else self.attrs * (self.attrs - 1) // 2
 
 
-class QueuedScore(SimpleNamespace):
-    score = None  # type: float
-    state = None  # type: Iterable
-    next_state = None  # type: Iterable
+class ModelQueue:
+    def __init__(self):
+        self.lock = Lock()
+        self.model = []
+        self.state = None
+
+    def put(self, row, state):
+        with self.lock:
+            self.model.append(row)
+            self.state = state
+
+    def get(self):
+        with self.lock:
+            model, self.model = self.model, []
+            state, self.state = self.state, None
+        return model, state
 
 
 def compute_score(state):
@@ -362,20 +367,26 @@ def compute_score(state):
     return sum(state),
 
 
-def run(compute, iterate_states, saved_state, state_count, progress, task):
+def row_for_state(score, state):
+    return list(score) + list(state)
+
+
+def run(compute_score: Callable, row_for_state: Callable,
+        iterate_states: Callable, saved_state: Iterable,
+        state_count: int, progress: int, task: TaskState):
     task.set_status("Getting combinations...")
     task.set_progress_value(0.1)
     states = iterate_states(saved_state)
 
     task.set_status("Getting scores...")
-    queue = Queue()
+    queue = ModelQueue()
     can_set_partial_result = True
 
     def do_work(st, next_st):
         try:
-            score = compute(st)
+            score = compute_score(st)
             if score is not None:
-                queue.put_nowait(QueuedScore(score=score, state=st, next_state=next_st))
+                queue.put(row_for_state(score, st), next_st)
         except Exception:
             pass
 
