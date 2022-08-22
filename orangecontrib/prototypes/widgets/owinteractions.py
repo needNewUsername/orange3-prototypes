@@ -7,12 +7,9 @@ from itertools import chain
 
 import numpy as np
 
-from AnyQt.QtCore import Qt, QSortFilterProxyModel
-from AnyQt.QtCore import QLineF
+from AnyQt.QtCore import Qt, QSortFilterProxyModel, QLineF, QModelIndex
 from AnyQt.QtGui import QStandardItem, QPainter, QColor, QPen
-from AnyQt.QtWidgets import QHeaderView
-from AnyQt.QtCore import QModelIndex
-from AnyQt.QtWidgets import QStyleOptionViewItem, QApplication, QStyle
+from AnyQt.QtWidgets import QHeaderView, QStyleOptionViewItem, QApplication, QStyle
 
 from Orange.data import Table, Domain, ContinuousVariable, StringVariable
 from Orange.widgets import gui
@@ -116,9 +113,9 @@ class Heuristic:
 class InteractionItemDelegate(gui.TableBarItem):
 	def __init__(self, **kwargs):
 		super().__init__(**kwargs)
-		self.r = QColor(255, 170, 127)
-		self.g = QColor(170, 242, 43)
-		self.b = QColor(70, 190, 250)
+		self.r = QColor("#ffaa7f")
+		self.g = QColor("#aaf22b")
+		self.b = QColor("#46befa")
 		self.__line = QLineF()
 		self.__pen = QPen(self.b, 5, Qt.SolidLine, Qt.RoundCap)
 
@@ -374,4 +371,5 @@ class OWInteractions(Orange.widgets.data.owcorrelations.OWCorrelations):
 
 
 if __name__ == "__main__":  # pragma: no cover
-	WidgetPreview(OWInteractions).run(Table("iris"))
+	# WidgetPreview(OWInteractions).run(Table("iris"))
+	WidgetPreview(OWInteractions).run(Table("/Users/noah/Nextcloud/Fri/tables/mushrooms.tab"))
