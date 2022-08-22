@@ -37,11 +37,11 @@ class RankModel(QAbstractTableModel):
         self._max_rows = MAX_ROWS
         self._headers = []
 
-    def set_domain(self, table):
-        self.domain = table.domain
-        n_attrs = len(table.domain.attributes)
+    def set_domain(self, domain):
+        self.domain = domain
+        n_attrs = len(domain.attributes)
         self.n_comb = n_attrs * (n_attrs - 1) // 2
-        self.attr_names = [attr.name.lower() for attr in self.domain.attributes]
+        self.attr_names = [attr.name.lower() for attr in domain.attributes]
 
     def set_scorer(self, scorer):
         self.scorer = scorer
@@ -286,8 +286,8 @@ class Widget(OWWidget, ConcurrentWidgetMixin):
     @Inputs.data
     def set_data(self, data):
         self.data = data
-        self.model.set_domain(data)
         self.attrs = len(data.domain.attributes)
+        self.model.set_domain(data.domain)
         self.feature_model.set_domain(data.domain)
         self.initialize()
 
@@ -310,12 +310,11 @@ class Widget(OWWidget, ConcurrentWidgetMixin):
             self.filter.setEnabled(True)
 
     def on_partial_result(self, result):
-        add_to_model, latest_state = result.get()
-        if add_to_model:
-            self.saved_state = latest_state
-            self.model.append(add_to_model)
-            self.progress = len(self.model)
-            self.progressBarSet(self.progress * 100 // self.state_count())
+        add_to_model, latest_state = result
+        self.saved_state = latest_state
+        self.model.append(add_to_model)
+        self.progress = len(self.model)
+        self.progressBarSet(self.progress * 100 // self.state_count())
 
     def on_done(self, result):
         self.button.setText("Finished")
@@ -355,15 +354,16 @@ class ModelQueue:
             self.model.append(row)
             self.state = state
 
-    def get(self):
+    def get_array(self):
         with self.lock:
-            model, self.model = self.model, []
+            model = np.array(self.model)
+            self.model = []
             state, self.state = self.state, None
         return model, state
 
 
 def compute_score(state):
-    time.sleep(1e-7)
+    # time.sleep(1e-7)
     return sum(state),
 
 
@@ -399,23 +399,23 @@ def run(compute_score: Callable, row_for_state: Callable,
     try:
         while True:
             if task.is_interruption_requested():
-                return queue
+                return queue.get_array()
             task.set_progress_value(progress * 100 // state_count)
             progress += 1
             state = copy.copy(next_state)
             next_state = copy.copy(next(states))
             do_work(state, next_state)
             if can_set_partial_result:
-                task.set_partial_result(queue)
+                task.set_partial_result(queue.get_array())
                 can_set_partial_result = False
                 Timer(0.05, reset_flag).start()
     except StopIteration:
         do_work(state, None)
-        task.set_partial_result(queue)
-    return queue
+        task.set_partial_result(queue.get_array())
+    return queue.get_array()
 
 
 if __name__ == "__main__":
     # WidgetPreview(Widget).run(Table("iris"))
-    WidgetPreview(Widget).run(Table("/Users/noah/Nextcloud/Fri/tables/mushrooms.tab"))
-    # WidgetPreview(Widget).run(Table("/Users/noah/Nextcloud/Fri/tables/GDS3713-small.tab"))
+    # WidgetPreview(Widget).run(Table("/Users/noah/Nextcloud/Fri/tables/mushrooms.tab"))
+    WidgetPreview(Widget).run(Table("/Users/noah/Nextcloud/Fri/tables/GDS3713-small.tab"))

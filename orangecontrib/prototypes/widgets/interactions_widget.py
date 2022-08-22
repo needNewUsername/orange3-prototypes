@@ -1,11 +1,5 @@
-from queue import Queue, Empty
-from types import SimpleNamespace
-from typing import Optional, Iterable, Callable
-from threading import Timer
-import copy
-
-from AnyQt.QtCore import QModelIndex, Qt, QLineF, QSortFilterProxyModel, pyqtSignal as Signal
-from AnyQt.QtWidgets import QTableView, QVBoxLayout, QHeaderView, QDialog, QLineEdit, \
+from AnyQt.QtCore import QModelIndex, Qt, QLineF
+from AnyQt.QtWidgets import QTableView, QVBoxLayout, QHeaderView, QLineEdit, \
     QStyleOptionViewItem, QApplication, QStyle
 from AnyQt.QtGui import QColor, QPainter, QPen
 
@@ -13,15 +7,14 @@ from Orange.data import Table
 from Orange.preprocess import Discretize
 from Orange.widgets import gui
 from Orange.widgets.utils.widgetpreview import WidgetPreview
-from Orange.widgets.widget import OWWidget
+from Orange.widgets.widget import OWWidget, AttributeList
 from Orange.widgets.utils.signals import Input, Output
-from Orange.widgets.visualize.utils import VizRankDialogAttrPair
-from Orange.widgets.utils.concurrent import ConcurrentMixin, TaskState
-from Orange.widgets.utils.messages import WidgetMessagesMixin
-from Orange.widgets.widget import Msg
+from Orange.widgets.utils.concurrent import ConcurrentWidgetMixin
+from Orange.widgets.utils.itemmodels import DomainModel
+from Orange.widgets.settings import Setting, ContextSetting
 
-from orangecontrib.prototypes.widgets.nptablemodel import RankModel
-from orangecontrib.prototypes.interactions import Interaction
+from orangecontrib.prototypes.widgets.nptablemodel import RankModel, run
+from orangecontrib.prototypes.interactions import Interaction, HeuristicType, Heuristic
 
 
 class InteractionItemDelegate(gui.TableBarItem):
@@ -93,92 +86,143 @@ class InteractionItemDelegate(gui.TableBarItem):
         self.drawViewItemText(style, painter, opt, textrect)
 
 
-class InteractionVizRank(VizRankDialogAttrPair):
-    captionTitle = ""
+class InteractionWidget(OWWidget, ConcurrentWidgetMixin):
+    name = "Interaction Rank"
+    want_control_area = False
 
-    processingStateChanged = Signal(int)
-    progressBarValueChanged = Signal(float)
-    messageActivated = Signal(Msg)
-    messageDeactivated = Signal(Msg)
-    selectionChanged = Signal(object)
+    class Inputs:
+        data = Input("Data", Table)
 
-    def __init__(self, master):
-        """Initialize the attributes and set up the interface"""
-        QDialog.__init__(self, master, windowTitle=self.captionTitle)
-        WidgetMessagesMixin.__init__(self)
-        ConcurrentMixin.__init__(self)
+    class Outputs:
+        features = Output("Features", AttributeList)
+
+    selection = ContextSetting([])
+    heuristic_type = Setting(0)
+
+    def __init__(self):
+        OWWidget.__init__(self)
+        ConcurrentWidgetMixin.__init__(self)
+
+        self.keep_running = True
+        self.saved_state = None
+        self.progress = 0
+
+        self.data = None  # type: Table
+        self.work_data = None  # type: Table
+        self.attrs = 0
+
+        self.interaction = None
+        self.heuristic = None
+
         self.setLayout(QVBoxLayout())
 
-        self.insert_message_bar()
-        self.layout().insertWidget(0, self.message_bar)
-        self.master = master
+        self.heuristic_combo = gui.comboBox(
+            self, self, "heuristic_type", items=HeuristicType.items(),
+            callback=self.on_heuristic_combo_changed,
+        )
 
-        self.keep_running = False
-        self.scheduled_call = None
-        self.saved_state = None
-        self.saved_progress = 0
+        self.feature = self.feature_index = None
+        self.feature_model = DomainModel(
+            order=DomainModel.ATTRIBUTES, separators=False,
+            placeholder="(All combinations)")
+        feature_combo = gui.comboBox(
+            self, self, "feature", callback=self.on_feature_combo_changed,
+            model=self.feature_model, searchable=True
+        )
 
         self.filter = QLineEdit()
         self.filter.setPlaceholderText("Filter ...")
-        self.filter.textChanged.connect(self.filter_changed)
-        self.layout().addWidget(self.filter)
-        # Remove focus from line edit
+        self.filter.textChanged.connect(self.on_filter_changed)
         self.setFocus(Qt.ActiveWindowFocusReason)
 
-        self.rank_model = RankModel(self)
-        self.rank_model.setHorizontalHeaderLabels([
-            "Score 1", "Score 2", "Feature 1", "Feature 2"
-        ])
-        self.model_proxy = QSortFilterProxyModel(
-            self, filterCaseSensitivity=Qt.CaseInsensitive
-        )
-        self.model_proxy.setSourceModel(self.rank_model)
-        self.rank_table = view = QTableView(
-            selectionBehavior=QTableView.SelectRows,
-            selectionMode=QTableView.SingleSelection,
-            showGrid=False,
-            editTriggers=gui.TableView.NoEditTriggers)
-        view.setItemDelegate(InteractionItemDelegate())
-        view.setModel(self.rank_model)
-        view.selectionModel().selectionChanged.connect(
-            self.on_selection_changed)
+        self.model = RankModel()
+        self.model.setHorizontalHeaderLabels((
+            "Interaction", "Information Gain", "Feature 1", "Feature 2"
+        ))
+        view = QTableView(selectionBehavior=QTableView.SelectRows,
+                          selectionMode=QTableView.SingleSelection,
+                          showGrid=False,
+                          editTriggers=gui.TableView.NoEditTriggers)
         view.setSortingEnabled(True)
         view.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        view.setItemDelegate(InteractionItemDelegate())
+        view.setModel(self.model)
+        view.selectionModel().selectionChanged.connect(self.on_selection_changed)
+
+        self.button = gui.button(self, self, "Start", callback=self.toggle)
+
+        self.layout().addWidget(feature_combo)
+        self.layout().addWidget(self.filter)
         self.layout().addWidget(view)
+        self.layout().addWidget(self.button)
 
-        self.button = gui.button(self, self, "Start", callback=self.toggle, default=True)
-
-        self.attrs = []
-        manual_change_signal = getattr(master, "xy_changed_manually", None)
-        if manual_change_signal:
-            manual_change_signal.connect(self.on_manual_change)
-
-        self.heuristic = None
-        self.use_heuristic = False
-        self.sel_feature_index = None
+    @Inputs.data
+    def set_data(self, data):
+        self.selection = []
+        self.work_data = self.data = data
+        if data is not None:
+            if any(attr.is_continuous for attr in data.domain):
+                self.work_data = Discretize()(data)
+            self.attrs = len(data.domain.attributes)
+            self.model.set_domain(data.domain)
+            self.feature_model.set_domain(data.domain)
+            self.interaction = Interaction(self.work_data)
+            self.model.set_scorer(self.interaction)
+            self.heuristic = Heuristic(self.interaction.gains, self.heuristic_type)
+        self.initialize()
 
     def initialize(self):
         if self.task is not None:
             self.keep_running = False
             self.cancel()
-        self.keep_running = False
-        self.scheduled_call = None
+        self.keep_running = True
         self.saved_state = None
-        self.saved_progress = 0
+        self.progress = 0
         self.progressBarFinished()
-        self.rank_model.clear()
+        self.model.clear()
         self.button.setText("Start")
-        self.button.setEnabled(self.check_preconditions())
+        self.button.setEnabled(True)
 
-        data = self.master.data
-        self.attrs = data and data.domain.attributes
-        self.heuristic = None
-        self.use_heuristic = False
-        self.sel_feature_index = None  # self.master.feature or data.domain.index(self.master.feature)
-        if data:
-            self.interaction = Interaction(self.master.data)
-            self.rank_model.set_domain(self.master.data)
-            self.rank_model.set_scorer(self.interaction)
+    def commit(self):
+        if self.data is None:
+            self.Outputs.features.send(None)
+            return
+
+        self.Outputs.features.send(AttributeList(
+            [self.data.domain[attr] for attr in self.selection]))
+
+    def toggle(self):
+        self.keep_running = not self.keep_running
+        if not self.keep_running:
+            self.button.setText("Pause")
+            self.button.repaint()
+            self.progressBarInit()
+            self.filter.setText("")
+            self.filter.setEnabled(False)
+            self.start(run, self.compute_score, self.row_for_state,
+                       self.iterate_states, self.saved_state,
+                       self.state_count(), self.progress)
+        else:
+            self.button.setText("Continue")
+            self.button.repaint()
+            self.cancel()
+            self.progressBarFinished()
+            self.filter.setEnabled(True)
+
+    def on_selection_changed(self, selected):
+        self.selection = [self.model.data(ind) for ind in selected.indexes()[-2:]]
+        self.commit()
+
+    def on_filter_changed(self, text):
+        self.model.set_filter(text)
+
+    def on_feature_combo_changed(self):
+        self.feature_index = self.feature and self.data.domain.index(self.feature)
+        self.initialize()
+
+    def on_heuristic_combo_changed(self):
+        self.heuristic = Heuristic(self.interaction.gains, self.heuristic_type)
+        self.initialize()
 
     def compute_score(self, state):
         attr1, attr2 = state
@@ -188,201 +232,47 @@ class InteractionVizRank(VizRankDialogAttrPair):
         gain2 = self.interaction.gains[attr2] / h
         return score, gain1, gain2
 
-    def row_for_state(self, score, state):
+    @staticmethod
+    def row_for_state(score, state):
         return [score[0], sum(score)] + list(state)
 
-    def check_preconditions(self):
-        return self.master.data is not None
-
-    def on_selection_changed(self, selected, deselected):
-        pass
-
-    def on_manual_change(self, attr1, attr2):
-        pass
-
     def iterate_states(self, initial_state):
-        if self.sel_feature_index is not None:
-            return self.iterate_states_by_feature(initial_state)
-        elif self.use_heuristic:
+        if self.feature is not None:
+            return self._iterate_by_feature(initial_state)
+        if self.heuristic is not None:
             return self.heuristic.get_states(initial_state)
-        else:
-            return self.iterate_all_states(initial_state)
+        return self._iterate_all(initial_state)
 
-    def iterate_states_by_feature(self, initial_state):
-        _, sj = initial_state or (0, 0)
-        for j in range(sj, len(self.attrs)):
-            if j != self.sel_feature_index:
-                yield self.sel_feature_index, j
-
-    def iterate_all_states(self, initial_state):
-        si, sj = initial_state or (0, 0)
-        for i in range(si, len(self.attrs)):
-            for j in range(sj, i):
+    def _iterate_all(self, initial_state):
+        i0, j0 = initial_state or (0, 0)
+        for i in range(i0, self.attrs):
+            for j in range(j0, i):
                 yield i, j
-            sj = 0
+            j0 = 0
+
+    def _iterate_by_feature(self, initial_state):
+        _, j0 = initial_state or (0, 0)
+        for j in range(j0, self.attrs):
+            if j != self.feature_index:
+                yield self.feature_index, j
 
     def state_count(self):
-        n = len(self.attrs)
-        return n * (n - 1) / 2 if self.sel_feature_index is None else n - 1
+        return self.attrs if self.feature is not None else self.attrs * (self.attrs - 1) // 2
 
-    def on_partial_result(self, result: Queue):
-        rows = []
-        try:
-            while True:
-                queued = result.get_nowait()
-                self.saved_state = queued.next_state
-                row = self.row_for_state(queued.score, queued.state)
-                rows.append(row)
-        except Empty:
-            if rows:
-                self.rank_model.append(rows)
+    def on_partial_result(self, result):
+        add_to_model, latest_state = result
+        self.saved_state = latest_state
+        self.model.append(add_to_model)
+        self.progress = len(self.model)
+        self.progressBarSet(self.progress * 100 // self.state_count())
 
-        self.saved_progress = len(self.rank_model)
-        self._update_progress()
-
-    def _update_model(self):
-        pass
-
-    def toggle(self):
-        self.keep_running = not self.keep_running
-        if self.keep_running:
-            self.button.setText("Pause")
-            self.button.repaint()
-            self.progressBarInit()
-            self.before_running()
-            self.start(run_vizrank, self.compute_score,
-                       self.iterate_states, self.saved_state,
-                       self.saved_progress, self.state_count())
-        else:
-            self.button.setText("Continue")
-            self.button.repaint()
-            self.cancel()
-            self._stopped()
-
-    def _connect_signals(self, state):
-        super()._connect_signals(state)
-        state.progress_changed.connect(self.master.progressBarSet)
-        state.status_changed.connect(self.master.setStatusMessage)
-
-    def _disconnect_signals(self, state):
-        super()._disconnect_signals(state)
-        state.progress_changed.disconnect(self.master.progressBarSet)
-        state.status_changed.disconnect(self.master.setStatusMessage)
-
-    def _on_task_done(self, future):
-        super()._on_task_done(future)
-        self.__set_state_ready()
-
-    def __set_state_ready(self):
-        self._set_empty_status()
-        self.master.setBlocking(False)
-
-    def __set_state_busy(self):
-        self.master.progressBarInit()
-        self.master.setBlocking(True)
-
-    def _set_empty_status(self):
-        self.master.progressBarFinished()
-        self.master.setStatusMessage("")
-
-
-def run_vizrank(compute_score: Callable, iterate_states: Callable,
-                saved_state: Optional[Iterable], progress: int,
-                state_count: int, task: TaskState):
-    task.set_status("Getting combinations...")
-    task.set_progress_value(0.1)
-    states = iterate_states(saved_state)
-
-    task.set_status("Getting scores...")
-    queue = Queue()
-    can_set_partial_result = True
-
-    def do_work(st, next_st):
-        try:
-            score = compute_score(st)
-            if score is not None:
-                queue.put_nowait(Score(score=score, state=st, next_state=next_st))
-        except Exception:  # ignore current state in case of any problem
-            pass
-
-    def reset_flag():
-        nonlocal can_set_partial_result
-        can_set_partial_result = True
-
-    state = None
-    next_state = next(states)
-    try:
-        while True:
-            if task.is_interruption_requested():
-                return queue
-            task.set_progress_value(progress * 100 // max(1, state_count))
-            progress += 1
-            state = copy.copy(next_state)
-            next_state = copy.copy(next(states))
-            do_work(state, next_state)
-            if can_set_partial_result:
-                task.set_partial_result(queue)
-                can_set_partial_result = False
-                Timer(0.05, reset_flag).start()
-    except StopIteration:
-        do_work(state, None)
-        task.set_partial_result(queue)
-    return queue
-
-
-class Score(SimpleNamespace):
-    score = None  # type: Iterable
-    state = None  # type: Iterable
-    next_state = None  # type: Iterable
-
-
-class InteractionWidget(OWWidget):
-    name = "Interaction Rank"
-    want_main_area = False
-    want_control_area = True
-
-    feature = None  # ContextSetting(None)
-
-    class Inputs:
-        data = Input("Data", Table)
-
-    class Outputs:
-        data = Output("Data", Table)
-
-    def __init__(self):
-        OWWidget.__init__(self)
-
-        self.data = None  # type: Table
-        self.attr_color = None
-
-        box = gui.vBox(self.controlArea)
-        self.vizrank, _ = InteractionVizRank.add_vizrank(
-            None, self, None, self._vizrank_selection_changed)
-
-        box.layout().addWidget(self.vizrank.filter)
-        box.layout().addWidget(self.vizrank.rank_table)
-        box.layout().addWidget(self.vizrank.button)
-
-    @Inputs.data
-    def set_data(self, data):
-        self.data = Discretize()(data)
-        self.selection = []
-        self.apply()
-        self.vizrank.button.setEnabled(data is not None)
-
-    def _vizrank_selection_changed(self, *args):
-        self.selection = list(args)
-        self.commit()
-
-    def apply(self):
-        self.vizrank.initialize()
-        if self.data is not None:
-            self.vizrank.toggle()
-
-    def commit(self):
-        pass
+    def on_done(self, result):
+        self.button.setText("Finished")
+        self.button.setEnabled(False)
+        self.filter.setEnabled(True)
 
 
 if __name__ == "__main__":  # pragma: no cover
     # WidgetPreview(InteractionWidget).run(Table("iris"))
-    WidgetPreview(InteractionWidget).run(Table("/Users/noah/Nextcloud/Fri/tables/mushrooms.tab"))
+    # WidgetPreview(InteractionWidget).run(Table("/Users/noah/Nextcloud/Fri/tables/mushrooms.tab"))
+    WidgetPreview(InteractionWidget).run(Table("/Users/noah/Nextcloud/Fri/tables/GDS3713-small.tab"))

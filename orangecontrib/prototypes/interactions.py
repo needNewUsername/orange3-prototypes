@@ -74,8 +74,8 @@ class Heuristic:
 
 
 class HeuristicType(IntEnum):
-    INFO_GAIN, RANDOM = 0, 1
+    RANDOM, INFO_GAIN = 0, 1
 
     @staticmethod
     def items():
-        return ["Info Gain Heuristic", "Random Search"]
+        return ["Random Search", "Information Gain Heuristic"]
