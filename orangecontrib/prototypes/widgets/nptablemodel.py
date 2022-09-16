@@ -2,7 +2,6 @@ import copy
 from numbers import Number
 from typing import Iterable, Callable
 from threading import Timer, Lock
-import time
 import numpy as np
 
 from AnyQt.QtCore import QModelIndex, Qt, QAbstractTableModel
@@ -15,6 +14,8 @@ from Orange.widgets.utils.widgetpreview import WidgetPreview
 from Orange.widgets.utils.concurrent import ConcurrentWidgetMixin, TaskState
 from Orange.widgets.utils.signals import Input
 from Orange.widgets.utils.itemmodels import DomainModel
+
+from orangecontrib.prototypes.interactions import Interaction
 
 
 MAX_ROWS = int(1e9)
@@ -286,6 +287,7 @@ class Widget(OWWidget, ConcurrentWidgetMixin):
     @Inputs.data
     def set_data(self, data):
         self.data = data
+        self.score = Interaction(data)
         self.attrs = len(data.domain.attributes)
         self.model.set_domain(data.domain)
         self.feature_model.set_domain(data.domain)
@@ -299,7 +301,7 @@ class Widget(OWWidget, ConcurrentWidgetMixin):
             self.progressBarInit()
             self.filter.setText("")
             self.filter.setEnabled(False)
-            self.start(run, compute_score, row_for_state,
+            self.start(run, self.compute_score, self.row_for_state,
                        self.iterate_states, self.saved_state,
                        self.state_count(), self.progress)
         else:
@@ -342,6 +344,12 @@ class Widget(OWWidget, ConcurrentWidgetMixin):
     def state_count(self):
         return self.attrs if self.feature is not None else self.attrs * (self.attrs - 1) // 2
 
+    def row_for_state(self, score, state):
+        return [score] + list(state)
+
+    def compute_score(self, state):
+        return self.score(*state)
+
 
 class ModelQueue:
     def __init__(self):
@@ -354,21 +362,19 @@ class ModelQueue:
             self.model.append(row)
             self.state = state
 
-    def get_array(self):
+    def get(self):
         with self.lock:
-            model = np.array(self.model)
-            self.model = []
+            model, self.model = self.model, []
             state, self.state = self.state, None
         return model, state
 
 
-def compute_score(state):
-    # time.sleep(1e-7)
-    return sum(state),
+class Scorer:
+    def __init__(self, data):
+        self.data = data
 
-
-def row_for_state(score, state):
-    return list(score) + list(state)
+    def __call__(self, attr1, attr2):
+        return self.data.X[:, attr1].sum() + self.data.X[:, attr2].sum()
 
 
 def run(compute_score: Callable, row_for_state: Callable,
@@ -399,23 +405,22 @@ def run(compute_score: Callable, row_for_state: Callable,
     try:
         while True:
             if task.is_interruption_requested():
-                return queue.get_array()
+                return queue.get()
             task.set_progress_value(progress * 100 // state_count)
             progress += 1
             state = copy.copy(next_state)
             next_state = copy.copy(next(states))
             do_work(state, next_state)
             if can_set_partial_result:
-                task.set_partial_result(queue.get_array())
+                task.set_partial_result(queue.get())
                 can_set_partial_result = False
                 Timer(0.05, reset_flag).start()
     except StopIteration:
         do_work(state, None)
-        task.set_partial_result(queue.get_array())
-    return queue.get_array()
+        task.set_partial_result(queue.get())
+    return queue.get()
 
 
 if __name__ == "__main__":
     # WidgetPreview(Widget).run(Table("iris"))
-    # WidgetPreview(Widget).run(Table("/Users/noah/Nextcloud/Fri/tables/mushrooms.tab"))
-    WidgetPreview(Widget).run(Table("/Users/noah/Nextcloud/Fri/tables/GDS3713-small.tab"))
+    WidgetPreview(Widget).run(Table("aml-1k"))

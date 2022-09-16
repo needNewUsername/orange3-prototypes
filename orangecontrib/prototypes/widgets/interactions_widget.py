@@ -6,8 +6,8 @@ from AnyQt.QtGui import QColor, QPainter, QPen
 from Orange.data import Table
 from Orange.preprocess import Discretize
 from Orange.widgets import gui
-from Orange.widgets.utils.widgetpreview import WidgetPreview
 from Orange.widgets.widget import OWWidget, AttributeList
+from Orange.widgets.utils.widgetpreview import WidgetPreview
 from Orange.widgets.utils.signals import Input, Output
 from Orange.widgets.utils.concurrent import ConcurrentWidgetMixin
 from Orange.widgets.utils.itemmodels import DomainModel
@@ -108,10 +108,10 @@ class InteractionWidget(OWWidget, ConcurrentWidgetMixin):
         self.progress = 0
 
         self.data = None  # type: Table
-        self.work_data = None  # type: Table
-        self.attrs = 0
+        self.prep_data = None  # type: Table
+        self.n_attrs = 0
 
-        self.interaction = None
+        self.score = None
         self.heuristic = None
 
         self.setLayout(QVBoxLayout())
@@ -159,16 +159,16 @@ class InteractionWidget(OWWidget, ConcurrentWidgetMixin):
     @Inputs.data
     def set_data(self, data):
         self.selection = []
-        self.work_data = self.data = data
+        self.prep_data = self.data = data
         if data is not None:
-            if any(attr.is_continuous for attr in data.domain):
-                self.work_data = Discretize()(data)
-            self.attrs = len(data.domain.attributes)
+            if any(attr.is_continuous for attr in self.data.domain):
+                self.prep_data = Discretize()(self.data)
+            self.n_attrs = len(data.domain.attributes)
             self.model.set_domain(data.domain)
             self.feature_model.set_domain(data.domain)
-            self.interaction = Interaction(self.work_data)
-            self.model.set_scorer(self.interaction)
-            self.heuristic = Heuristic(self.interaction.gains, self.heuristic_type)
+            self.score = Interaction(self.prep_data)
+            self.model.set_scorer(self.score)
+            self.heuristic = Heuristic(self.score.gains, self.heuristic_type)
         self.initialize()
 
     def initialize(self):
@@ -221,15 +221,15 @@ class InteractionWidget(OWWidget, ConcurrentWidgetMixin):
         self.initialize()
 
     def on_heuristic_combo_changed(self):
-        self.heuristic = Heuristic(self.interaction.gains, self.heuristic_type)
+        self.heuristic = Heuristic(self.score.gains, self.heuristic_type)
         self.initialize()
 
     def compute_score(self, state):
         attr1, attr2 = state
-        h = self.interaction.class_h
-        score = self.interaction(attr1, attr2) / h
-        gain1 = self.interaction.gains[attr1] / h
-        gain2 = self.interaction.gains[attr2] / h
+        h = self.score.class_h
+        score = self.score(attr1, attr2) / h
+        gain1 = self.score.gains[attr1] / h
+        gain2 = self.score.gains[attr2] / h
         return score, gain1, gain2
 
     @staticmethod
@@ -245,26 +245,29 @@ class InteractionWidget(OWWidget, ConcurrentWidgetMixin):
 
     def _iterate_all(self, initial_state):
         i0, j0 = initial_state or (0, 0)
-        for i in range(i0, self.attrs):
+        for i in range(i0, self.n_attrs):
             for j in range(j0, i):
                 yield i, j
             j0 = 0
 
     def _iterate_by_feature(self, initial_state):
         _, j0 = initial_state or (0, 0)
-        for j in range(j0, self.attrs):
+        for j in range(j0, self.n_attrs):
             if j != self.feature_index:
                 yield self.feature_index, j
 
     def state_count(self):
-        return self.attrs if self.feature is not None else self.attrs * (self.attrs - 1) // 2
+        if self.feature is None:
+            return self.n_attrs * (self.n_attrs - 1) // 2
+        return self.n_attrs
 
     def on_partial_result(self, result):
         add_to_model, latest_state = result
-        self.saved_state = latest_state
-        self.model.append(add_to_model)
-        self.progress = len(self.model)
-        self.progressBarSet(self.progress * 100 // self.state_count())
+        if latest_state:
+            self.saved_state = latest_state
+            self.model.append(add_to_model)
+            self.progress = len(self.model)
+            self.progressBarSet(self.progress * 100 // self.state_count())
 
     def on_done(self, result):
         self.button.setText("Finished")
@@ -274,5 +277,4 @@ class InteractionWidget(OWWidget, ConcurrentWidgetMixin):
 
 if __name__ == "__main__":  # pragma: no cover
     # WidgetPreview(InteractionWidget).run(Table("iris"))
-    # WidgetPreview(InteractionWidget).run(Table("/Users/noah/Nextcloud/Fri/tables/mushrooms.tab"))
-    WidgetPreview(InteractionWidget).run(Table("/Users/noah/Nextcloud/Fri/tables/GDS3713-small.tab"))
+    WidgetPreview(InteractionWidget).run(Table("aml-1k"))
