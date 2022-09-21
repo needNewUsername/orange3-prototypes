@@ -8,6 +8,7 @@ from AnyQt.QtCore import QModelIndex, Qt, QAbstractTableModel
 from AnyQt.QtWidgets import QTableView, QVBoxLayout, QHeaderView, QLineEdit
 
 from Orange.data import Variable, Table
+from Orange.preprocess import Discretize
 from Orange.widgets import gui
 from Orange.widgets.widget import OWWidget
 from Orange.widgets.utils.widgetpreview import WidgetPreview
@@ -15,7 +16,7 @@ from Orange.widgets.utils.concurrent import ConcurrentWidgetMixin, TaskState
 from Orange.widgets.utils.signals import Input
 from Orange.widgets.utils.itemmodels import DomainModel
 
-from orangecontrib.prototypes.interactions import Interaction
+from orangecontrib.prototypes.interactions import InteractionScorer
 
 
 MAX_ROWS = int(1e9)
@@ -287,7 +288,7 @@ class Widget(OWWidget, ConcurrentWidgetMixin):
     @Inputs.data
     def set_data(self, data):
         self.data = data
-        self.score = Interaction(data)
+        self.score = InteractionScorer(Discretize()(data))
         self.attrs = len(data.domain.attributes)
         self.model.set_domain(data.domain)
         self.feature_model.set_domain(data.domain)
@@ -364,7 +365,7 @@ class ModelQueue:
 
     def get(self):
         with self.lock:
-            model, self.model = self.model, []
+            model, self.model = np.array(self.model), []
             state, self.state = self.state, None
         return model, state
 

@@ -3,14 +3,30 @@ from itertools import chain
 from enum import IntEnum
 
 
-class Interaction:
-    def __init__(self, disc_data):
-        self.data = disc_data
-        self.n_attrs = len(self.data.domain.attributes)
-        self.class_h = self.entropy(self.data.Y)
-        self.attr_h = np.zeros(self.n_attrs)
-        self.gains = np.zeros(self.n_attrs)
-        self.removed_h = np.zeros((self.n_attrs, self.n_attrs))
+def _distribution(ar):
+    nans = np.isnan(ar)
+
+    if ar.ndim == 1:
+        if nans.any():
+            ar = ar[~nans]
+        counts = np.bincount(ar.astype(int))
+    else:
+        if nans.any():
+            ar = ar[~nans.any(axis=1)]
+        _, counts = np.unique(ar, return_counts=True, axis=0)
+    return counts / ar.shape[0]
+
+
+def _entropy(ar):
+    p = _distribution(ar)
+    return -np.sum(p * np.log2(p))
+
+
+class InteractionScorer:
+    def __init__(self, data):
+        self.data = data
+        self.class_entropy = 0
+        self.information_gain = np.zeros(data.X.shape[1])
 
         # Precompute information gain of each attribute for faster overall
         # computation and to create heuristic. Only removes necessary NaN values
@@ -19,34 +35,22 @@ class Interaction:
         # In certain situations this can cause unexpected results i.e. negative
         # information gains or negative interactions lower than individual
         # attribute information.
-        self.compute_gains()
+        self._precompute()
 
-    @staticmethod
-    def distribution(ar):
-        nans = np.isnan(ar)
-        if nans.any():
-            if ar.ndim == 1:
-                ar = ar[~nans]
-            else:
-                ar = ar[~nans.any(axis=1)]
-        _, counts = np.unique(ar, return_counts=True, axis=0)
-        return counts / len(ar)
-
-    def entropy(self, ar):
-        p = self.distribution(ar)
-        return -np.sum(p * np.log2(p))
-
-    def compute_gains(self):
-        for attr in range(self.n_attrs):
-            self.attr_h[attr] = self.entropy(self.data.X[:, attr])
-            self.gains[attr] = self.attr_h[attr] + self.class_h \
-                               - self.entropy(np.c_[self.data.X[:, attr], self.data.Y])
+    def _precompute(self):
+        self.class_entropy = _entropy(self.data.Y)
+        for attr in range(self.information_gain.size):
+            self.information_gain[attr] = self.class_entropy \
+                                          + _entropy(self.data.X[:, attr]) \
+                                          - _entropy(np.column_stack((self.data.X[:, attr], self.data.Y)))
 
     def __call__(self, attr1, attr2):
-        attrs = np.c_[self.data.X[:, attr1], self.data.X[:, attr2]]
-        self.removed_h[attr1, attr2] = self.entropy(attrs) + self.class_h - self.entropy(np.c_[attrs, self.data.Y])
-        score = self.removed_h[attr1, attr2] - self.gains[attr1] - self.gains[attr2]
-        return score
+        attrs = np.column_stack((self.data.X[:, attr1], self.data.X[:, attr2]))
+        return self.class_entropy \
+               - self.information_gain[attr1] \
+               - self.information_gain[attr2] \
+               + _entropy(attrs) \
+               - _entropy(np.column_stack((attrs, self.data.Y)))
 
 
 class Heuristic:

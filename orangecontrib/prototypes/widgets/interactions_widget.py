@@ -14,7 +14,7 @@ from Orange.widgets.utils.itemmodels import DomainModel
 from Orange.widgets.settings import Setting, ContextSetting
 
 from orangecontrib.prototypes.widgets.nptablemodel import RankModel, run
-from orangecontrib.prototypes.interactions import Interaction, HeuristicType, Heuristic
+from orangecontrib.prototypes.interactions import InteractionScorer, HeuristicType, Heuristic
 
 
 class InteractionItemDelegate(gui.TableBarItem):
@@ -63,8 +63,8 @@ class InteractionItemDelegate(gui.TableBarItem):
             model = index.model()
             attr1 = model.data(index.siblingAtColumn(2), Qt.EditRole)
             attr2 = model.data(index.siblingAtColumn(3), Qt.EditRole)
-            h = model.scorer.class_h
-            l_bar, r_bar = model.scorer.gains[int(attr1)], model.scorer.gains[int(attr2)]
+            h = model.scorer.class_entropy
+            l_bar, r_bar = model.scorer.information_gain[int(attr1)], model.scorer.information_gain[int(attr2)]
             l_bar, r_bar = width * max(l_bar, 0) / h, width * max(r_bar, 0) / h
             interaction *= width
 
@@ -166,9 +166,9 @@ class InteractionWidget(OWWidget, ConcurrentWidgetMixin):
             self.n_attrs = len(data.domain.attributes)
             self.model.set_domain(data.domain)
             self.feature_model.set_domain(data.domain)
-            self.score = Interaction(self.prep_data)
+            self.score = InteractionScorer(self.prep_data)
             self.model.set_scorer(self.score)
-            self.heuristic = Heuristic(self.score.gains, self.heuristic_type)
+            self.heuristic = Heuristic(self.score.information_gain, self.heuristic_type)
         self.initialize()
 
     def initialize(self):
@@ -221,15 +221,15 @@ class InteractionWidget(OWWidget, ConcurrentWidgetMixin):
         self.initialize()
 
     def on_heuristic_combo_changed(self):
-        self.heuristic = Heuristic(self.score.gains, self.heuristic_type)
+        self.heuristic = Heuristic(self.score.information_gain, self.heuristic_type)
         self.initialize()
 
     def compute_score(self, state):
         attr1, attr2 = state
-        h = self.score.class_h
+        h = self.score.class_entropy
         score = self.score(attr1, attr2) / h
-        gain1 = self.score.gains[attr1] / h
-        gain2 = self.score.gains[attr2] / h
+        gain1 = self.score.information_gain[attr1] / h
+        gain2 = self.score.information_gain[attr2] / h
         return score, gain1, gain2
 
     @staticmethod
@@ -263,11 +263,10 @@ class InteractionWidget(OWWidget, ConcurrentWidgetMixin):
 
     def on_partial_result(self, result):
         add_to_model, latest_state = result
-        if latest_state:
-            self.saved_state = latest_state
-            self.model.append(add_to_model)
-            self.progress = len(self.model)
-            self.progressBarSet(self.progress * 100 // self.state_count())
+        self.saved_state = latest_state
+        self.model.append(add_to_model)
+        self.progress = len(self.model)
+        self.progressBarSet(self.progress * 100 // self.state_count())
 
     def on_done(self, result):
         self.button.setText("Finished")
