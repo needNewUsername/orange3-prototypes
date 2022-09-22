@@ -73,7 +73,18 @@ class RankModel(QAbstractTableModel):
             return gui.attributeIconDict[value]
         if role == Qt.DisplayRole:
             if isinstance(value, Number):
-                return "{:.1f}%".format(100 * value)
+                absval = abs(value)
+                strlen = len(str(int(absval)))
+                value = '{:.{}{}}'.format(value,
+                                          2 if absval < .001 else
+                                          3 if strlen < 2 else
+                                          1 if strlen < 5 else
+                                          0 if strlen < 6 else
+                                          3,
+                                          'f' if (absval == 0 or
+                                                  absval >= .001 and
+                                                  strlen < 6)
+                                          else 'e')
             return str(value)
         if role == Qt.TextAlignmentRole and isinstance(value, Number):
             return Qt.AlignRight | Qt.AlignVCenter
@@ -230,6 +241,7 @@ class Widget(OWWidget, ConcurrentWidgetMixin):
         self.progress = 0
 
         self.data = None
+        self.pp_data = None
         self.attrs = 0
 
         self.setLayout(QVBoxLayout())
@@ -270,7 +282,7 @@ class Widget(OWWidget, ConcurrentWidgetMixin):
         self.model.set_filter(text)
 
     def feature_combo_changed(self):
-        self.feature_index = self.feature and self.data.domain.index(self.feature)
+        self.feature_index = self.feature and self.pp_data.domain.index(self.feature)
         self.initialize()
 
     def initialize(self):
@@ -288,10 +300,11 @@ class Widget(OWWidget, ConcurrentWidgetMixin):
     @Inputs.data
     def set_data(self, data):
         self.data = data
-        self.score = InteractionScorer(Discretize()(data))
+        self.pp_data = Discretize()(self.data)
+        self.score = InteractionScorer(self.pp_data)
         self.attrs = len(data.domain.attributes)
-        self.model.set_domain(data.domain)
-        self.feature_model.set_domain(data.domain)
+        self.model.set_domain(self.pp_data.domain)
+        self.feature_model.set_domain(self.pp_data.domain)
         self.initialize()
 
     def toggle(self):
@@ -365,17 +378,9 @@ class ModelQueue:
 
     def get(self):
         with self.lock:
-            model, self.model = np.array(self.model), []
+            model, self.model = self.model, []
             state, self.state = self.state, None
         return model, state
-
-
-class Scorer:
-    def __init__(self, data):
-        self.data = data
-
-    def __call__(self, attr1, attr2):
-        return self.data.X[:, attr1].sum() + self.data.X[:, attr2].sum()
 
 
 def run(compute_score: Callable, row_for_state: Callable,

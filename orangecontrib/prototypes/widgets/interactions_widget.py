@@ -78,7 +78,6 @@ class InteractionItemDelegate(gui.TableBarItem):
             pen.setColor(self.g if interaction >= 0 else self.r)
             painter.setPen(pen)
             draw_line(l_bar, interaction)
-            # draw_line(0, interaction)
             painter.restore()
             textrect.adjust(0, 0, 0, -textoffset)
 
@@ -108,7 +107,7 @@ class InteractionWidget(OWWidget, ConcurrentWidgetMixin):
         self.progress = 0
 
         self.data = None  # type: Table
-        self.prep_data = None  # type: Table
+        self.pp_data = None  # type: Table
         self.n_attrs = 0
 
         self.score = None
@@ -159,14 +158,14 @@ class InteractionWidget(OWWidget, ConcurrentWidgetMixin):
     @Inputs.data
     def set_data(self, data):
         self.selection = []
-        self.prep_data = self.data = data
+        self.pp_data = self.data = data
         if data is not None:
             if any(attr.is_continuous for attr in self.data.domain):
-                self.prep_data = Discretize()(self.data)
+                self.pp_data = Discretize()(self.data)
             self.n_attrs = len(data.domain.attributes)
-            self.model.set_domain(data.domain)
-            self.feature_model.set_domain(data.domain)
-            self.score = InteractionScorer(self.prep_data)
+            self.model.set_domain(self.pp_data.domain)
+            self.feature_model.set_domain(self.pp_data.domain)
+            self.score = InteractionScorer(self.pp_data)
             self.model.set_scorer(self.score)
             self.heuristic = Heuristic(self.score.information_gain, self.heuristic_type)
         self.initialize()
@@ -225,12 +224,10 @@ class InteractionWidget(OWWidget, ConcurrentWidgetMixin):
         self.initialize()
 
     def compute_score(self, state):
-        attr1, attr2 = state
-        h = self.score.class_entropy
-        score = self.score(attr1, attr2) / h
-        gain1 = self.score.information_gain[attr1] / h
-        gain2 = self.score.information_gain[attr2] / h
-        return score, gain1, gain2
+        scores = (self.score(*state),
+                  self.score.information_gain[state[0]],
+                  self.score.information_gain[state[1]])
+        return tuple(self.score.normalize(score) for score in scores)
 
     @staticmethod
     def row_for_state(score, state):

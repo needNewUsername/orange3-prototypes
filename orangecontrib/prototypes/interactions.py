@@ -3,17 +3,28 @@ from itertools import chain
 from enum import IntEnum
 
 
+def _get_row_ids(ar):
+    row_ids = ar[:, 0].copy()
+    steps = ar[:, :-1].max(axis=0) + 1
+    for i in range(1, ar.shape[1]):
+        row_ids += ar[:, i] * np.prod(steps[:i])
+    return row_ids
+
+
 def _distribution(ar):
     nans = np.isnan(ar)
 
     if ar.ndim == 1:
         if nans.any():
             ar = ar[~nans]
-        counts = np.bincount(ar.astype(int))
     else:
         if nans.any():
             ar = ar[~nans.any(axis=1)]
-        _, counts = np.unique(ar, return_counts=True, axis=0)
+        # Calling `np.unique` with `axis=0` works, but it slows down the main thread.
+        # The implementation probably doesn't release GIL. Until it gets fixed use
+        # `_get_row_ids` (should work, assuming `ar` contains non-negative integers).
+        ar = _get_row_ids(ar)
+    _, counts = np.unique(ar, return_counts=True)
     return counts / ar.shape[0]
 
 
@@ -51,6 +62,9 @@ class InteractionScorer:
                - self.information_gain[attr2] \
                + _entropy(attrs) \
                - _entropy(np.column_stack((attrs, self.data.Y)))
+
+    def normalize(self, score):
+        return score / self.class_entropy
 
 
 class Heuristic:
