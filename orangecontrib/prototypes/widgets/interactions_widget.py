@@ -1,41 +1,113 @@
+import copy
+from threading import Lock, Timer
+from typing import Callable, Optional, Iterable
+
+from AnyQt.QtGui import QColor, QPainter, QPen
 from AnyQt.QtCore import QModelIndex, Qt, QLineF
 from AnyQt.QtWidgets import QTableView, QVBoxLayout, QHeaderView, QLineEdit, \
     QStyleOptionViewItem, QApplication, QStyle
-from AnyQt.QtGui import QColor, QPainter, QPen
 
 from Orange.data import Table
-from Orange.preprocess import Discretize
+from Orange.preprocess import Discretize, Remove
 from Orange.widgets import gui
-from Orange.widgets.widget import OWWidget, AttributeList
+from Orange.widgets.widget import OWWidget, AttributeList, Msg
 from Orange.widgets.utils.widgetpreview import WidgetPreview
 from Orange.widgets.utils.signals import Input, Output
-from Orange.widgets.utils.concurrent import ConcurrentWidgetMixin
+from Orange.widgets.utils.concurrent import ConcurrentWidgetMixin, TaskState
 from Orange.widgets.utils.itemmodels import DomainModel
-from Orange.widgets.settings import Setting, ContextSetting
+from Orange.widgets.settings import Setting, ContextSetting, DomainContextHandler
 
-from orangecontrib.prototypes.widgets.nptablemodel import RankModel, run
+from orangecontrib.prototypes.ranktablemodel import RankModel
 from orangecontrib.prototypes.interactions import InteractionScorer, HeuristicType, Heuristic
 
 
-class InteractionItemDelegate(gui.TableBarItem):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.r = QColor("#ffaa7f")
-        self.g = QColor("#aaf22b")
-        self.b = QColor("#46befa")
-        self.__line = QLineF()
-        self.__pen = QPen(self.b, 5, Qt.SolidLine, Qt.RoundCap)
+class ModelQueue:
+    """
+    Another queueing object, similar to ``queue.Queue``.
+    The main difference is that ``get()`` returns all its
+    contents at the same time, instead of one by one.
+    """
+    def __init__(self):
+        self.lock = Lock()
+        self.model = []
+        self.state = None
 
-    def paint(
-            self, painter: QPainter, option: QStyleOptionViewItem,
-            index: QModelIndex
-    ) -> None:
+    def put(self, row, state):
+        with self.lock:
+            self.model.append(row)
+            self.state = state
+
+    def get(self):
+        with self.lock:
+            model, self.model = self.model, []
+            state, self.state = self.state, None
+        return model, state
+
+
+def run(compute_score: Callable, row_for_state: Callable,
+        iterate_states: Callable, saved_state: Optional[Iterable],
+        progress: int, state_count: int, task: TaskState):
+    """
+    Replaces ``run_vizrank``, with some minor adjustments.
+        - ``ModelQueue`` replaces ``queue.Queue``
+        - `row_for_state` parameter added
+        - `scores` parameter removed
+    """
+    task.set_status("Getting combinations...")
+    task.set_progress_value(0.1)
+    states = iterate_states(saved_state)
+
+    task.set_status("Getting scores...")
+    queue = ModelQueue()
+    can_set_partial_result = True
+
+    def do_work(st, next_st):
+        try:
+            score = compute_score(st)
+            if score is not None:
+                queue.put(row_for_state(score, st), next_st)
+        except Exception:
+            pass
+
+    def reset_flag():
+        nonlocal can_set_partial_result
+        can_set_partial_result = True
+
+    state = None
+    next_state = next(states)
+    try:
+        while True:
+            if task.is_interruption_requested():
+                return queue.get()
+            task.set_progress_value(progress * 100 // state_count)
+            progress += 1
+            state = copy.copy(next_state)
+            next_state = copy.copy(next(states))
+            do_work(state, next_state)
+            # for simple scores (e.g. correlations widget) and many feature
+            # combinations, the 'partial_result_ready' signal (emitted by
+            # invoking 'task.set_partial_result') was emitted too frequently
+            # for a longer period of time and therefore causing the widget
+            # being unresponsive
+            if can_set_partial_result:
+                task.set_partial_result(queue.get())
+                can_set_partial_result = False
+                Timer(0.05, reset_flag).start()
+    except StopIteration:
+        do_work(state, None)
+        task.set_partial_result(queue.get())
+    return queue.get()
+
+
+class InteractionItemDelegate(gui.TableBarItem):
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem,
+              index: QModelIndex) -> None:
         opt = QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
         widget = option.widget
         style = QApplication.style() if widget is None else widget.style()
-        pen = self.__pen
-        line = self.__line
+        pen = QPen(QColor("#46befa"), 5, Qt.SolidLine, Qt.RoundCap)
+        line = QLineF()
         self.__style = style
         text = opt.text
         opt.text = ""
@@ -43,9 +115,8 @@ class InteractionItemDelegate(gui.TableBarItem):
         textrect = style.subElementRect(
             QStyle.SE_ItemViewItemText, opt, widget)
 
-        # interaction is None for attribute items ->
-        # only draw bars for first column
         interaction = self.cachedData(index, Qt.EditRole)
+        # only draw bars for first column
         if index.column() == 0 and interaction is not None:
             rect = option.rect
             pw = self.penWidth
@@ -58,24 +129,23 @@ class InteractionItemDelegate(gui.TableBarItem):
                 line.setLine(origin + start, baseline, origin + start + length, baseline)
                 painter.drawLine(line)
 
-            # negative information gains stem from issues in interaction calculation
-            # may cause bars reaching out of intended area
-            model = index.model()
-            attr1 = model.data(index.siblingAtColumn(2), Qt.EditRole)
-            attr2 = model.data(index.siblingAtColumn(3), Qt.EditRole)
-            h = model.scorer.class_entropy
-            l_bar, r_bar = model.scorer.information_gain[int(attr1)], model.scorer.information_gain[int(attr2)]
-            l_bar, r_bar = width * max(l_bar, 0) / h, width * max(r_bar, 0) / h
+            scorer = index.model().scorer
+            attr1 = self.cachedData(index.siblingAtColumn(2), Qt.EditRole)
+            attr2 = self.cachedData(index.siblingAtColumn(3), Qt.EditRole)
+            l_bar = scorer.normalize(scorer.information_gain[int(attr1)])
+            r_bar = scorer.normalize(scorer.information_gain[int(attr2)])
+            # negative information gains stem from issues in interaction
+            # calculation and may cause bars reaching out of intended area
+            l_bar, r_bar = width * max(l_bar, 0), width * max(r_bar, 0)
             interaction *= width
 
-            pen.setColor(self.b)
             pen.setWidth(pw)
             painter.save()
             painter.setRenderHint(QPainter.Antialiasing)
             painter.setPen(pen)
             draw_line(0, l_bar)
             draw_line(l_bar + interaction, r_bar)
-            pen.setColor(self.g if interaction >= 0 else self.r)
+            pen.setColor(QColor("#aaf22b") if interaction >= 0 else QColor("#ffaa7f"))
             painter.setPen(pen)
             draw_line(l_bar, interaction)
             painter.restore()
@@ -87,6 +157,9 @@ class InteractionItemDelegate(gui.TableBarItem):
 
 class InteractionWidget(OWWidget, ConcurrentWidgetMixin):
     name = "Interaction Rank"
+    description = "Compute all pairwise attribute interactions."
+    category = None
+    icon = "icons/Interactions.svg"
     want_control_area = False
 
     class Inputs:
@@ -95,8 +168,17 @@ class InteractionWidget(OWWidget, ConcurrentWidgetMixin):
     class Outputs:
         features = Output("Features", AttributeList)
 
+    settingsHandler = DomainContextHandler()
     selection = ContextSetting([])
     heuristic_type = Setting(0)
+
+    class Information(OWWidget.Information):
+        removed_cons_feat = Msg("Constant features have been removed.")
+
+    class Warning(OWWidget.Warning):
+        not_enough_vars = Msg("At least two features are needed.")
+        not_enough_inst = Msg("At least two instances are needed.")
+        no_class_var = Msg("Target feature missing")
 
     def __init__(self):
         OWWidget.__init__(self)
@@ -149,6 +231,7 @@ class InteractionWidget(OWWidget, ConcurrentWidgetMixin):
         view.selectionModel().selectionChanged.connect(self.on_selection_changed)
 
         self.button = gui.button(self, self, "Start", callback=self.toggle)
+        self.button.setEnabled(False)
 
         self.layout().addWidget(feature_combo)
         self.layout().addWidget(self.filter)
@@ -157,17 +240,29 @@ class InteractionWidget(OWWidget, ConcurrentWidgetMixin):
 
     @Inputs.data
     def set_data(self, data):
+        self.closeContext()
+        self.clear_messages()
         self.selection = []
-        self.pp_data = self.data = data
+        self.data = data
+        self.pp_data = None
         if data is not None:
-            if any(attr.is_continuous for attr in self.data.domain):
-                self.pp_data = Discretize()(self.data)
-            self.n_attrs = len(data.domain.attributes)
-            self.model.set_domain(self.pp_data.domain)
-            self.feature_model.set_domain(self.pp_data.domain)
-            self.score = InteractionScorer(self.pp_data)
-            self.model.set_scorer(self.score)
-            self.heuristic = Heuristic(self.score.information_gain, self.heuristic_type)
+            if len(data) < 2:
+                self.Warning.not_enough_inst()
+            elif data.Y.size == 0:
+                self.Warning.no_class_var()
+            else:
+                remover = Remove(Remove.RemoveConstant)
+                self.pp_data = Discretize()(remover(data))
+                if remover.attr_results["removed"]:
+                    self.Information.removed_cons_feat()
+                if len(self.pp_data.domain.attributes) < 2:
+                    self.Warning.not_enough_vars()
+                self.n_attrs = len(self.pp_data.domain.attributes)
+                self.score = InteractionScorer(self.pp_data)
+                self.model.set_domain(self.pp_data.domain, scorer=self.score)
+                self.heuristic = Heuristic(self.score.information_gain, self.heuristic_type)
+                self.feature_model.set_domain(self.pp_data.domain)
+        self.openContext(self.pp_data)
         self.initialize()
 
     def initialize(self):
@@ -180,7 +275,7 @@ class InteractionWidget(OWWidget, ConcurrentWidgetMixin):
         self.progressBarFinished()
         self.model.clear()
         self.button.setText("Start")
-        self.button.setEnabled(True)
+        self.button.setEnabled(self.pp_data is not None)
 
     def commit(self):
         if self.data is None:
@@ -200,7 +295,7 @@ class InteractionWidget(OWWidget, ConcurrentWidgetMixin):
             self.filter.setEnabled(False)
             self.start(run, self.compute_score, self.row_for_state,
                        self.iterate_states, self.saved_state,
-                       self.state_count(), self.progress)
+                       self.progress, self.state_count())
         else:
             self.button.setText("Continue")
             self.button.repaint()
@@ -213,14 +308,15 @@ class InteractionWidget(OWWidget, ConcurrentWidgetMixin):
         self.commit()
 
     def on_filter_changed(self, text):
-        self.model.set_filter(text)
+        self.model.filter(text)
 
     def on_feature_combo_changed(self):
-        self.feature_index = self.feature and self.data.domain.index(self.feature)
+        self.feature_index = self.feature and self.pp_data.domain.index(self.feature)
         self.initialize()
 
     def on_heuristic_combo_changed(self):
-        self.heuristic = Heuristic(self.score.information_gain, self.heuristic_type)
+        if self.pp_data is not None:
+            self.heuristic = Heuristic(self.score.information_gain, self.heuristic_type)
         self.initialize()
 
     def compute_score(self, state):
@@ -260,10 +356,11 @@ class InteractionWidget(OWWidget, ConcurrentWidgetMixin):
 
     def on_partial_result(self, result):
         add_to_model, latest_state = result
-        self.saved_state = latest_state
-        self.model.append(add_to_model)
-        self.progress = len(self.model)
-        self.progressBarSet(self.progress * 100 // self.state_count())
+        if add_to_model:
+            self.saved_state = latest_state
+            self.model.append(add_to_model)
+            self.progress = len(self.model)
+            self.progressBarSet(self.progress * 100 // self.state_count())
 
     def on_done(self, result):
         self.button.setText("Finished")
@@ -272,5 +369,4 @@ class InteractionWidget(OWWidget, ConcurrentWidgetMixin):
 
 
 if __name__ == "__main__":  # pragma: no cover
-    # WidgetPreview(InteractionWidget).run(Table("iris"))
-    WidgetPreview(InteractionWidget).run(Table("aml-1k"))
+    WidgetPreview(InteractionWidget).run(Table("iris"))

@@ -3,15 +3,19 @@ from itertools import chain
 from enum import IntEnum
 
 
-def _get_row_ids(ar):
+def get_row_ids(ar):
     row_ids = ar[:, 0].copy()
-    steps = ar[:, :-1].max(axis=0) + 1
+    # Hopefully I can assume that nobody will put
+    # their data into more than 10000 bins...
+    # otherwise generating steps like so might be safer:
+    # steps = ar[:, :-1].max(axis=0) + 1
+    # step_i = np.prod(steps[:i])
     for i in range(1, ar.shape[1]):
-        row_ids += ar[:, i] * np.prod(steps[:i])
+        row_ids += ar[:, i] * 10000 ** i
     return row_ids
 
 
-def _distribution(ar):
+def distribution(ar):
     nans = np.isnan(ar)
 
     if ar.ndim == 1:
@@ -20,16 +24,21 @@ def _distribution(ar):
     else:
         if nans.any():
             ar = ar[~nans.any(axis=1)]
-        # Calling `np.unique` with `axis=0` works, but it slows down the main thread.
-        # The implementation probably doesn't release GIL. Until it gets fixed use
-        # `_get_row_ids` (should work, assuming `ar` contains non-negative integers).
-        ar = _get_row_ids(ar)
+
+        # Using `np.unique` with `axis=0` to get row frequency
+        # slows down the main thread!
+        # I'm not sure why, but my guess is, that the underlying
+        # implementation doesn't release the GIL. The simplest solution
+        # (assuming the data has been discretized) is to instead
+        # generate a unique number based on the contents of each row.
+        ar = get_row_ids(ar)
+
     _, counts = np.unique(ar, return_counts=True)
     return counts / ar.shape[0]
 
 
-def _entropy(ar):
-    p = _distribution(ar)
+def entropy(ar):
+    p = distribution(ar)
     return -np.sum(p * np.log2(p))
 
 
@@ -39,29 +48,33 @@ class InteractionScorer:
         self.class_entropy = 0
         self.information_gain = np.zeros(data.X.shape[1])
 
-        # Precompute information gain of each attribute for faster overall
-        # computation and to create heuristic. Only removes necessary NaN values
-        # to keep as much data as possible and keep entropies and information gains
-        # invariant of third attribute.
-        # In certain situations this can cause unexpected results i.e. negative
-        # information gains or negative interactions lower than individual
-        # attribute information.
-        self._precompute()
+        self.precompute()
 
-    def _precompute(self):
-        self.class_entropy = _entropy(self.data.Y)
+    def precompute(self):
+        """
+        Precompute information gain of each attribute to speed up
+        computation and to create heuristic.
+
+        Only removes necessary NaNs to keep as much data as possible.
+        This preserves entropies and information gains invariant of
+        third attribute. This also has the unintended side effect of
+        producing negative information gains in certain situations as
+        well as negative interactions with greater magnitude than the
+        combined information gain.
+        """
+        self.class_entropy = entropy(self.data.Y)
         for attr in range(self.information_gain.size):
             self.information_gain[attr] = self.class_entropy \
-                                          + _entropy(self.data.X[:, attr]) \
-                                          - _entropy(np.column_stack((self.data.X[:, attr], self.data.Y)))
+                                          + entropy(self.data.X[:, attr]) \
+                                          - entropy(np.column_stack((self.data.X[:, attr], self.data.Y)))
 
     def __call__(self, attr1, attr2):
         attrs = np.column_stack((self.data.X[:, attr1], self.data.X[:, attr2]))
         return self.class_entropy \
                - self.information_gain[attr1] \
                - self.information_gain[attr2] \
-               + _entropy(attrs) \
-               - _entropy(np.column_stack((attrs, self.data.Y)))
+               + entropy(attrs) \
+               - entropy(np.column_stack((attrs, self.data.Y)))
 
     def normalize(self, score):
         return score / self.class_entropy
